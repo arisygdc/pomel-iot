@@ -1,0 +1,5 @@
+[config]
+wifi_ssid = "WIFI_SSID"
+wifi_password = "WIFI_PASSWORD"
+telegram_api_base = "https://api.telegram.org"
+telegram_bot_token = "BOT_TOKEN"
