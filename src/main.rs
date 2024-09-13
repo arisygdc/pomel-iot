@@ -143,7 +143,7 @@ pub struct BotQuery {
 }
 
 const INVALID_CMD: &str = "Invalid Command";
-const INVALID_UNIT: &str = "unknown unit, example: 1h (one hours)";
+const INVALID_UNIT: &str = "Invalid unit, example: 1h (one hours)";
 
 fn run_query<R1, R2> (
     q: &BotQuery, 
