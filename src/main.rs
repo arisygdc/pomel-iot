@@ -6,23 +6,33 @@ use esp_idf_svc::{
 };
 use log::{info, warn};
 use relay::{DoubleRelay, RelayQuery, SetState};
+use serde::Deserialize;
 use telegram::TelePool;
 
 mod relay;
 mod telegram;
 pub mod helper;
 
-// FIXME: Not working
-#[toml_cfg::toml_config]
-pub struct AppConfig {
-    #[default("")]
-    wifi_ssid: &'static str,
-    #[default("")]
-    wifi_password: &'static str,
-    #[default("https://api.telegram.org")]
-    telegram_api_base: &'static str,
-    #[default("")]
-    telegram_bot_token: &'static str,
+#[derive(Deserialize, Debug)]
+struct AppConfig {
+    wifi: WifiConfig,
+    telegram: TelegramConfig,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct WifiConfig {
+    ssid: String,
+    password: String
+}
+
+#[derive(Deserialize, Debug)]
+pub struct TelegramConfig {
+    api_base: String,
+    bot_token: String
+}
+
+fn load_config() -> AppConfig {
+    toml::from_str(include_str!("../cfg.toml")).expect("Failed to parse config")
 }
 
 const TELE_FETCH_LIMIT: usize = 3;
@@ -44,11 +54,13 @@ fn main() -> anyhow::Result<()> {
         sys_loop,
     )?;
 
-    connect_wifi(&mut wifi)?;
+    let cfg = load_config();
+    connect_wifi(&mut wifi, &cfg.wifi)?;
     let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
     info!("Wifi DHCP info: {:?}", ip_info);
 
     sync_ntp()?;
+
 
     let http_connection = EspHttpConnection::new(&HttpConfiguration {
         use_global_ca_store: true,
@@ -57,7 +69,7 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     let client = Client::wrap(http_connection);
-    let mut tele_pool: TelePool<TELE_FETCH_LIMIT> = TelePool::new(client);
+    let mut tele_pool: TelePool<TELE_FETCH_LIMIT> = TelePool::new(client, &cfg.telegram);
 
     // INITIALIZE PIN
     let (first_pin, second_pin) = unsafe {
@@ -70,7 +82,7 @@ fn main() -> anyhow::Result<()> {
     loop {
         FreeRtos::delay_ms(5000);
         
-        let connect = ensure_wifi_connected(&mut wifi);
+        let connect = ensure_wifi_connected(&mut wifi, &cfg.wifi);
         match connect {
             Ok(ip_info) => {
                 info!("Wifi DHCP info: {:?}", ip_info);
@@ -218,20 +230,20 @@ fn sync_ntp() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn ensure_wifi_connected(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<IpInfo, EspError> {
+fn ensure_wifi_connected(wifi: &mut BlockingWifi<EspWifi<'static>>, config: &WifiConfig) -> Result<IpInfo, EspError> {
     if !wifi.is_connected()? {
-        connect_wifi(wifi)?;
+        connect_wifi(wifi, config)?;
     }
 
     wifi.wifi().sta_netif().get_ip_info()
 }
 
-fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<(), EspError> {
+fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, config: &WifiConfig) -> Result<(), EspError> {
     let wifi_configuration: Configuration = Configuration::Client(ClientConfiguration {
-        ssid: APP_CONFIG.wifi_ssid.try_into().unwrap(),
+        ssid: config.ssid.as_str().try_into().unwrap(),
         bssid: None,
         auth_method: AuthMethod::WPA2Personal,
-        password: APP_CONFIG.wifi_password.try_into().unwrap(),
+        password: config.password.as_str().try_into().unwrap(),
         channel: None,
         ..Default::default()
     });

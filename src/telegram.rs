@@ -2,21 +2,23 @@ use embedded_svc::http::client::Client;
 use esp_idf_svc::http::client::{self, EspHttpConnection};
 use serde::{Deserialize, Serialize};
 
-use crate::APP_CONFIG;
+use crate::TelegramConfig;
 
-pub struct TelePool<const FETCH_LIMIT: usize> {
+pub struct TelePool<'cfg, const FETCH_LIMIT: usize> {
     client: Client<EspHttpConnection>,
     last_updtid: u32,
     send_cnt: u32,
+    config: &'cfg TelegramConfig
 }
 
-impl<const FETCH_LIMIT: usize> TelePool<FETCH_LIMIT> {
+impl<'cfg, const FETCH_LIMIT: usize> TelePool<'cfg, FETCH_LIMIT> {
     #[inline]
-    pub fn new(client: Client<EspHttpConnection>) -> Self {
+    pub fn new(client: Client<EspHttpConnection>, config: &'cfg TelegramConfig) -> Self {
         Self {
             client,
             last_updtid: 0,
-            send_cnt: 0
+            send_cnt: 0,
+            config
         }
     }
 
@@ -29,8 +31,8 @@ impl<const FETCH_LIMIT: usize> TelePool<FETCH_LIMIT> {
 
             format!(
                 "{}/bot{}/getUpdates?limit={}{}", 
-                APP_CONFIG.telegram_api_base, 
-                APP_CONFIG.telegram_bot_token,
+                self.config.api_base, 
+                self.config.bot_token,
                 FETCH_LIMIT,
                 offset
             )
@@ -53,7 +55,7 @@ impl<const FETCH_LIMIT: usize> TelePool<FETCH_LIMIT> {
 
     pub fn send_message(&mut self, text: String) -> anyhow::Result<()> {
         let headers = [("Content-Type", "application/json")];
-        let url = format!("{}/bot{}/sendMessage", APP_CONFIG.telegram_api_base, APP_CONFIG.telegram_bot_token);
+        let url = format!("{}/bot{}/sendMessage", self.config.api_base, self.config.bot_token);
         let request = {
             let mut request = self.client.post(url.as_ref(), &headers)?;
 
