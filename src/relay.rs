@@ -111,11 +111,11 @@ where
 
     pub fn set(&mut self, target: RelayAddr, state: SetState) -> anyhow::Result<()> {
         let muxed = target as u8;
-        if muxed == 1 {
+        if (muxed & 1) == 1 {
             self.first_relay.set(state.clone())?;
         }
 
-        if (muxed << 1) == 1 {
+        if (muxed >> 1) == 1 {
             self.second_relay.set(state)?;
         }
 
