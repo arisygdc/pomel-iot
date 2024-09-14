@@ -11,6 +11,7 @@ name = "pomel"
 harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
 
 [profile.release]
+lto = true
 opt-level = "s"
 
 [profile.dev]
