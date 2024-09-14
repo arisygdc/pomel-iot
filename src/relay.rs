@@ -1,13 +1,14 @@
+use std::fmt::Display;
+
 use anyhow::Error;
 use esp_idf_svc::hal::{gpio::{Output, OutputPin, PinDriver}, peripheral::Peripheral};
 
-use crate::helper::sys_now;
+use crate::util::{sys_now, Time};
 
 #[derive(Clone)]
 pub struct RunOrder {
-    #[allow(dead_code)]
-    start_at: u64,
-    end_at: u64
+    pub start_at: Time,
+    pub end_at: Time
 }
 
 impl RunOrder {
@@ -15,7 +16,7 @@ impl RunOrder {
     /// panic when end <= start
     pub fn new(start_at: u64, end_at: u64) -> Self {
         assert!(start_at <= end_at);
-        Self{ start_at, end_at }
+        Self{ start_at: Time::new(start_at), end_at: Time::new(end_at) }
     }
 }
 
@@ -71,9 +72,16 @@ where
 
     fn is_run_deadline(&self, now: u64) -> bool {
         if let Some(r) = &self.running {
-            return r.end_at <= now;
+            return r.end_at <= Time::new(now);
         }
         false
+    }
+
+    fn get_status(&self) -> RelayStatus {
+        RelayStatus{
+            name: self.name,
+            run_info: self.running.as_ref()
+        }
     }
 }
 
@@ -159,9 +167,22 @@ where
         events
     }
 
+    pub fn get_status(&self, target: RelayAddr) -> DoubleRelayStatus {
+        let single = match target {
+            RelayAddr::First => self.first_relay.get_status(),
+            RelayAddr::Second => self.second_relay.get_status(),
+            RelayAddr::Both => return DoubleRelayStatus::Both([
+                self.first_relay.get_status(),
+                self.second_relay.get_status()
+            ])
+        };
+
+        DoubleRelayStatus::Single(single)
+    }
+
     const NAME_NOTFOUND: &'static str = "cannot resolve name";
     const INV_INSTRUCTION: &'static str = "invalid instruction";
-    pub fn interprete(&mut self, query: RelayQuery) -> anyhow::Result<()> {
+    pub fn interprete(&mut self, query: RelayQuery) -> anyhow::Result<DoubleRelayStatus> {
         let name = query.name.ok_or(Error::msg(Self::NAME_NOTFOUND))?;
         let r_addr = self.resolve_addr(name).ok_or(Error::msg(Self::NAME_NOTFOUND))?;
 
@@ -177,12 +198,39 @@ where
             }, false => SetState::Stop,
         };
         
-
         self.set(r_addr, instruction)?;
-        Ok(())
+        Ok(self.get_status(r_addr))
     }
 }
 
+pub enum DoubleRelayStatus<'r> {
+    Single(RelayStatus<'r>),
+    Both([RelayStatus<'r>; 2])
+}
+
+impl<'r> Display for DoubleRelayStatus<'r> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DoubleRelayStatus::Single(s) => write!(f, "{}", s),
+            DoubleRelayStatus::Both(b) => write!(f, "{}\n\n{}", b[0], b[1])
+        }
+    }
+}
+
+pub struct RelayStatus<'r> {
+    pub name: &'r str,
+    pub run_info: Option<&'r RunOrder>
+}
+
+impl<'r> Display for RelayStatus<'r> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Relay {} status ", self.name)?;
+        match self.run_info {
+            None => write!(f, "off"),
+            Some(ord) => write!(f, "on\nstart: {}\nfinish: {}", ord.start_at, ord.end_at),
+        }
+    }
+}
 #[derive(Default)]
 pub struct RelayQuery<'a> {
     pub name: Option<&'a str>,
