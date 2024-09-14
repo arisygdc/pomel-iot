@@ -5,13 +5,14 @@ use esp_idf_svc::{
     eventloop::EspSystemEventLoop, hal::{delay::FreeRtos, gpio::{Gpio5, Gpio6, OutputPin}, prelude::Peripherals}, http::client::{Configuration as HttpConfiguration, EspHttpConnection}, ipv4::IpInfo, nvs::EspDefaultNvsPartition, sntp::{EspSntp, SyncStatus}, sys::EspError, wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi}
 };
 use log::{info, warn};
-use relay::{DoubleRelay, RelayQuery, SetState};
+use relay::{DoubleRelay, DoubleRelayStatus, RelayQuery, SetState};
 use serde::Deserialize;
 use telegram::TelePool;
+use util::Queue;
 
 mod relay;
 mod telegram;
-pub mod helper;
+pub mod util;
 
 #[derive(Deserialize, Debug)]
 struct AppConfig {
@@ -79,6 +80,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut buffer = [0u8; 1024];
 
+    let mut message_queue = Queue::default();
     loop {
         FreeRtos::delay_ms(5000);
         
@@ -95,26 +97,40 @@ fn main() -> anyhow::Result<()> {
 
         let rsvc = relay_service(&mut relay);
         if let Err(err) = rsvc {
-            let send_result = tele_pool.send_message(err.to_string());
+            let send_result = tele_pool.send_message(&err.to_string());
             if let Err(err) = send_result {
                 warn!("{}", err);
-                FreeRtos::delay_ms(5000);
-                continue;
+                message_queue.enqueue(err.to_string());
             }
         }
     
         let tele_notif = get_tele_notif(&mut tele_pool, &mut buffer);
-        let query_list = match tele_notif {
-            Ok(notification) => notification,
-            Err(err) => {
-                warn!("failed to get updates: {}", err);
-                continue;
-            }
+        match tele_notif {
+            Ok(notification) => notification
+                .into_iter()
+                .for_each(|each| {
+                    match run_query(&each, &mut relay) {
+                        Ok(s) => { message_queue.enqueue(s.to_string()); },
+                        Err(err) => { message_queue.enqueue(err.to_string()); }
+                    }
+                }),
+            Err(err) => { warn!("failed to get updates: {}", err); }
         };
 
-        for query in query_list {
-            // TODO: callback
-            run_query(&query, &mut relay).unwrap();
+
+        const MAX_ITER: usize = 8;
+        let mut iter_cnt = 1;
+        while let Some(msg) = message_queue.dequeue() {
+            let sent_result = tele_pool.send_message(&msg);
+            if sent_result.is_err() {
+                message_queue.insert_head(msg);
+            }
+            
+            if iter_cnt == MAX_ITER {
+                break;
+            }
+
+            iter_cnt += 1;
         }
     }
 }
@@ -154,13 +170,14 @@ pub struct BotQuery {
     pub q: String
 }
 
+
 const INVALID_CMD: &str = "Invalid Command";
 const INVALID_UNIT: &str = "Invalid unit, example: 1h (one hours)";
 
-fn run_query<R1, R2> (
+fn run_query<'a, R1, R2> (
     q: &BotQuery, 
-    relay: &mut DoubleRelay<'_, R1, R2>
-) -> anyhow::Result<()> 
+    relay: &'a mut DoubleRelay<'_, R1, R2>
+) -> anyhow::Result<DoubleRelayStatus<'a>> 
     where 
         R1: OutputPin,
         R2: OutputPin
@@ -174,7 +191,7 @@ fn run_query<R1, R2> (
                 .next()
                 .ok_or(Error::msg(INVALID_CMD))?;
             rlq.name = Some(r_name);
-
+            
             let r_instruction = split
                 .next()
                 .ok_or(Error::msg(INVALID_CMD))?;
@@ -186,7 +203,6 @@ fn run_query<R1, R2> (
             };
             
             rlq.instruction = Some(r_instruction);
-            
 
             if let Some(r_pred) = split.next() {
                 rlq.duration = match r_pred.eq("for") {
