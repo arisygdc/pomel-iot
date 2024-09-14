@@ -53,7 +53,7 @@ impl<'cfg, const FETCH_LIMIT: usize> TelePool<'cfg, FETCH_LIMIT> {
         Ok(updates)
     }
 
-    pub fn send_message(&mut self, text: String) -> anyhow::Result<()> {
+    pub fn send_message(&mut self, text: &str) -> anyhow::Result<()> {
         let headers = [("Content-Type", "application/json")];
         let url = format!("{}/bot{}/sendMessage", self.config.api_base, self.config.bot_token);
         let request = {
@@ -81,9 +81,9 @@ impl<'cfg, const FETCH_LIMIT: usize> TelePool<'cfg, FETCH_LIMIT> {
 }
 
 #[derive(Serialize)]
-struct SendMessage {
+struct SendMessage<'a> {
     chat_id: u32,
-    text: String
+    text: &'a str
 }
 
 fn try_read<'de, T: Deserialize<'de>>(buf: &'de mut [u8], response: client::Response<&mut EspHttpConnection>) -> anyhow::Result<T> {
@@ -99,25 +99,20 @@ fn try_read<'de, T: Deserialize<'de>>(buf: &'de mut [u8], response: client::Resp
     Ok(body)
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct Updates {
     // pub ok: bool,
     pub result: Vec<Update>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct Update {
     pub update_id: u32,
     pub message: Message,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct Message {
     // pub chat: Chat,
     pub text: String,
 }
-
-// #[derive(Deserialize, Debug)]
-// pub struct Chat {
-//     pub id: i64,
-// }
