@@ -2,13 +2,14 @@ use core::str;
 use std::time::Duration;
 use anyhow::Error;
 use esp_idf_svc::{
-    eventloop::EspSystemEventLoop, hal::{delay::FreeRtos, gpio::{OutputPin, PinDriver}, prelude::Peripherals}, http::client::{Configuration as HttpConfiguration, EspHttpConnection}, nvs::EspDefaultNvsPartition, sntp::{EspSntp, SyncStatus}, sys::EspError, wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi}
+    eventloop::EspSystemEventLoop, hal::{delay::FreeRtos, gpio::{OutputPin, PinDriver}, prelude::Peripherals}, http::client::{Configuration as HttpConfiguration, EspHttpConnection}, nvs::EspDefaultNvsPartition, wifi::{BlockingWifi, EspWifi}
 };
 use log::{info, warn};
 use queue::MsgFMQueue;
 use relay::{DoubleRelay, DoubleRelayStatus, RelayQuery, SetState};
 use serde::Deserialize;
-use telegram::{SendMessage, TelePool};
+use telegram::{SendMessage, TeleAPI};
+use util::{connect_wifi, ensure_wifi_connected, sync_ntp};
 
 mod relay;
 mod telegram;
@@ -36,8 +37,6 @@ pub struct TelegramConfig {
 fn load_config() -> AppConfig {
     toml::from_str(include_str!("../cfg.toml")).expect("Failed to parse config")
 }
-
-const TELE_FETCH_LIMIT: usize = 1;
 
 fn main() -> anyhow::Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
@@ -71,7 +70,8 @@ fn main() -> anyhow::Result<()> {
 
     sync_ntp()?;
 
-    let mut tele_pool: TelePool<TELE_FETCH_LIMIT> = TelePool::new(&cfg.telegram);
+    const TELE_FETCH_LIMIT: usize = 1;
+    let mut tele_pool = TeleAPI::new(&cfg.telegram, TELE_FETCH_LIMIT);
 
     // INITIALIZE PIN
     let mut relay = DoubleRelay::new(peripherals.pins.gpio5, peripherals.pins.gpio6);
@@ -100,19 +100,25 @@ fn main() -> anyhow::Result<()> {
         
         match tele_notif {
             Ok(notification) => notification
-                .into_iter()
-                .for_each(|each| {
-                    let text = match run_query(&each, &mut relay) {
+            .into_iter()
+            .for_each(|each| {
+                let text = 
+                if each.is_command {
+                    match run_command(&each, &mut relay) {
                         Ok(s) => s.to_string(),
                         Err(err) => err.to_string()
-                    };
-
-                    let msg = SendMessage { chat_id: each.chat_id, text };
-                    message_queue.enqueue(msg);
-                }),
+                    }
+                } else {
+                    String::from("command starts with '/'")
+                };
+                
+                let msg = SendMessage { chat_id: each.chat_id, text };
+                message_queue.enqueue(msg);
+            }),
             Err(err) => { warn!("failed to get updates: {}", err); }
         };
-
+        info!("--- Delay 2 ---");
+        FreeRtos::delay_ms(10_000);
 
         const MAX_SEND_EFFORT: usize = 8;
         let send_result = send_message_queue(&mut tele_pool, &mut message_queue, MAX_SEND_EFFORT);
@@ -153,15 +159,19 @@ fn relay_service<R1, R2>(relay: &mut DoubleRelay<'_, R1, R2>) -> anyhow::Result<
 }
 
 fn send_message_queue(
-    tele_pool: &mut TelePool<TELE_FETCH_LIMIT>,
+    tele_api: &mut TeleAPI,
     message_queue: &mut MsgFMQueue,
     max_try: usize
 ) -> anyhow::Result<()> {
-    let http_connection = create_http_connection()?;
-    tele_pool.set_connection(http_connection);
+    if message_queue.is_empty() {
+        return Ok(());
+    }
 
-    let mut buffer = [0_u8; 256];
-        
+    let http_connection = create_http_connection()?;
+    let mut tele_pool = tele_api.create_client(http_connection);
+
+    let mut buffer = [0_u8; 512];
+    
     for _ in 0..max_try {
         let msg = match message_queue.peek(&mut buffer) {
             None => break,
@@ -180,35 +190,36 @@ fn send_message_queue(
     Ok(())
 }
 
-fn get_tele_notif(tele_pool: &mut TelePool<TELE_FETCH_LIMIT>, buffer: &mut [u8]) -> anyhow::Result<Vec<BotQuery>> {
+fn get_tele_notif(tele_api: &mut TeleAPI, buffer: &mut [u8]) -> anyhow::Result<Vec<BotQuery>> {
     let http_connection = create_http_connection()?;
-    tele_pool.set_connection(http_connection);
+    let mut tele_client = tele_api.create_client(http_connection);
 
-    let incoming_message = tele_pool.pool_fetch(buffer)?;
+    let incoming_message = tele_client.pool_fetch(buffer)?;
     let collect = incoming_message.result
         .into_iter()
-        .filter(|updt| updt.message.text.starts_with('/'))
         .map(|v| BotQuery {
             chat_id: v.message.chat.id,
-            q: v.message.text
+            is_command: v.message.text.starts_with('/'),
+            q: v.message.text,
         })
         .collect();
     
-    tele_pool.reset_connection();
+    info!("collect: {:?}", collect);
     Ok(collect)
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct BotQuery {
     pub chat_id: u32,
-    pub q: String
+    pub q: String,
+    pub is_command: bool
 }
 
 
 const INVALID_CMD: &str = "Invalid Command";
 const INVALID_UNIT: &str = "Invalid unit, example: 1h (one hours)";
 
-fn run_query<'a, R1, R2> (
+fn run_command<'a, R1, R2> (
     q: &BotQuery, 
     relay: &'a mut DoubleRelay<'_, R1, R2>
 ) -> anyhow::Result<DoubleRelayStatus<'a>> 
@@ -270,44 +281,4 @@ fn run_query<'a, R1, R2> (
         _ => Err(Error::msg("unregister command")),
         
     }
-}
-
-fn sync_ntp() -> anyhow::Result<()> {
-    let sntp = EspSntp::new_default()?;
-    println!("Synchronizing with NTP Server");
-    while sntp.get_sync_status() != SyncStatus::Completed { FreeRtos::delay_ms(10) }
-    println!("Time Sync Completed");
-    Ok(())
-}
-
-fn ensure_wifi_connected(wifi: &mut BlockingWifi<EspWifi<'static>>, config: &WifiConfig) -> Result<(), EspError> {
-    if wifi.is_connected()? {
-        return Ok(());
-    }
-    
-    connect_wifi(wifi, config)?;
-    let ip_info = wifi.wifi().sta_netif().get_ip_info();
-    info!("Wifi DHCP info: {:?}", ip_info);
-    Ok(())
-}
-
-fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, config: &WifiConfig) -> Result<(), EspError> {
-    let wifi_configuration: Configuration = Configuration::Client(ClientConfiguration {
-        ssid: config.ssid.as_str().try_into().unwrap(),
-        bssid: None,
-        auth_method: AuthMethod::WPA2Personal,
-        password: config.password.as_str().try_into().unwrap(),
-        channel: None,
-        ..Default::default()
-    });
-
-    wifi.set_configuration(&wifi_configuration)?;
-
-    wifi.start()?;
-    wifi.connect()?;
-    wifi.wait_netif_up()?;
-    info!("Wifi connected");
-    info!("Wifi netif up");
-
-    Ok(())
 }

@@ -1,5 +1,12 @@
 use std::fmt::Display;
 use std::time::{SystemTime, UNIX_EPOCH};
+use esp_idf_svc::hal::delay::FreeRtos;
+use esp_idf_svc::sntp::{EspSntp, SyncStatus};
+use log::info;
+use esp_idf_svc::sys::EspError;
+use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
+
+use crate::WifiConfig;
 
 const WIB_OFFSET: u64 = 25200;
 
@@ -72,4 +79,44 @@ pub fn sys_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+pub fn sync_ntp() -> anyhow::Result<()> {
+    let sntp = EspSntp::new_default()?;
+    println!("Synchronizing with NTP Server");
+    while sntp.get_sync_status() != SyncStatus::Completed { FreeRtos::delay_ms(10) }
+    println!("Time Sync Completed");
+    Ok(())
+}
+
+pub fn ensure_wifi_connected(wifi: &mut BlockingWifi<EspWifi<'static>>, config: &WifiConfig) -> Result<(), EspError> {
+    if wifi.is_connected()? {
+        return Ok(());
+    }
+    
+    connect_wifi(wifi, config)?;
+    let ip_info = wifi.wifi().sta_netif().get_ip_info();
+    info!("Wifi DHCP info: {:?}", ip_info);
+    Ok(())
+}
+
+pub fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, config: &WifiConfig) -> Result<(), EspError> {
+    let wifi_configuration: Configuration = Configuration::Client(ClientConfiguration {
+        ssid: config.ssid.as_str().try_into().unwrap(),
+        bssid: None,
+        auth_method: AuthMethod::WPA2Personal,
+        password: config.password.as_str().try_into().unwrap(),
+        channel: None,
+        ..Default::default()
+    });
+
+    wifi.set_configuration(&wifi_configuration)?;
+
+    wifi.start()?;
+    wifi.connect()?;
+    wifi.wait_netif_up()?;
+    info!("Wifi connected");
+    info!("Wifi netif up");
+
+    Ok(())
 }
