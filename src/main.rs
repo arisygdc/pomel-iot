@@ -2,13 +2,13 @@ use core::str;
 use anyhow::Error;
 use embedded_svc::http::client::Client;
 use esp_idf_svc::{
-    eventloop::EspSystemEventLoop, hal::{delay::FreeRtos, gpio::{Gpio5, Gpio6, OutputPin}, prelude::Peripherals}, http::client::{Configuration as HttpConfiguration, EspHttpConnection}, ipv4::IpInfo, nvs::EspDefaultNvsPartition, sntp::{EspSntp, SyncStatus}, sys::EspError, wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi}
+    eventloop::EspSystemEventLoop, hal::{delay::FreeRtos, gpio::{OutputPin, PinDriver}, prelude::Peripherals}, http::client::{Configuration as HttpConfiguration, EspHttpConnection}, nvs::EspDefaultNvsPartition, sntp::{EspSntp, SyncStatus}, sys::EspError, wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi}
 };
 use log::{info, warn};
 use relay::{DoubleRelay, DoubleRelayStatus, RelayQuery, SetState};
 use serde::Deserialize;
 use telegram::TelePool;
-use util::Queue;
+use util::FMemQueue;
 
 mod relay;
 mod telegram;
@@ -36,7 +36,7 @@ fn load_config() -> AppConfig {
     toml::from_str(include_str!("../cfg.toml")).expect("Failed to parse config")
 }
 
-const TELE_FETCH_LIMIT: usize = 3;
+const TELE_FETCH_LIMIT: usize = 1;
 
 fn main() -> anyhow::Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
@@ -49,69 +49,74 @@ fn main() -> anyhow::Result<()> {
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
-
+    
+    let mut internal_led = PinDriver::output(peripherals.pins.gpio2)?;
+    internal_led.set_high()?;
+    
     let mut wifi = BlockingWifi::wrap(
-        EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
+        EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs.clone()))?,
         sys_loop,
     )?;
-
+    
     let cfg = load_config();
-    connect_wifi(&mut wifi, &cfg.wifi)?;
+    info!("Connecting wifi ssid: {}", cfg.wifi.ssid);
+    while connect_wifi(&mut wifi, &cfg.wifi).is_err() {
+        info!("Reconnect Wifi");
+        FreeRtos::delay_ms(1000)
+    }
+
     let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
     info!("Wifi DHCP info: {:?}", ip_info);
 
     sync_ntp()?;
 
 
-    let http_connection = EspHttpConnection::new(&HttpConfiguration {
-        use_global_ca_store: true,
-        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
-        ..Default::default()
-    })?;
+    let http_connection = {
+        let http_config = HttpConfiguration  {
+            use_global_ca_store: true,
+            crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+            ..Default::default()
+        };
+        EspHttpConnection::new(&http_config)?
+    };
 
     let client = Client::wrap(http_connection);
     let mut tele_pool: TelePool<TELE_FETCH_LIMIT> = TelePool::new(client, &cfg.telegram);
 
     // INITIALIZE PIN
-    let (first_pin, second_pin) = unsafe {
-        (Gpio5::new(), Gpio6::new())
-    };
-    let mut relay = DoubleRelay::new(first_pin, second_pin);
+    let mut relay = DoubleRelay::new(peripherals.pins.gpio5, peripherals.pins.gpio6);
 
-    let mut buffer = [0u8; 1024];
-
-    let mut message_queue = Queue::default();
+    let mut message_queue = FMemQueue::new(nvs)?;
     loop {
-        FreeRtos::delay_ms(5000);
-        
-        let connect = ensure_wifi_connected(&mut wifi, &cfg.wifi);
-        match connect {
-            Ok(ip_info) => {
-                info!("Wifi DHCP info: {:?}", ip_info);
-            },
-            Err(err) => {
-                warn!("err: {:?}", err);
-                continue;
-            }
-        };
+        FreeRtos::delay_ms(10000);
 
         let rsvc = relay_service(&mut relay);
         if let Err(err) = rsvc {
             let send_result = tele_pool.send_message(&err.to_string());
             if let Err(err) = send_result {
                 warn!("{}", err);
-                message_queue.enqueue(err.to_string());
+                message_queue.enqueue(&err.to_string());
             }
         }
+
+        let connect = ensure_wifi_connected(&mut wifi, &cfg.wifi);
+        if let Err(err) = connect {
+            warn!("err: {:?}", err);
+            continue;
+        }
     
-        let tele_notif = get_tele_notif(&mut tele_pool, &mut buffer);
+        let tele_notif = {
+            let mut buffer = [0u8; 1024];
+            get_tele_notif(&mut tele_pool, &mut buffer)
+        };
+ 
         match tele_notif {
             Ok(notification) => notification
                 .into_iter()
                 .for_each(|each| {
                     match run_query(&each, &mut relay) {
-                        Ok(s) => { message_queue.enqueue(s.to_string()); },
-                        Err(err) => { message_queue.enqueue(err.to_string()); }
+                        Ok(s) => { message_queue.enqueue(&s.to_string()); },
+                        Err(err) => { message_queue.enqueue(&err.to_string()); }
                     }
                 }),
             Err(err) => { warn!("failed to get updates: {}", err); }
@@ -120,10 +125,15 @@ fn main() -> anyhow::Result<()> {
 
         const MAX_ITER: usize = 8;
         let mut iter_cnt = 1;
-        while let Some(msg) = message_queue.dequeue() {
-            let sent_result = tele_pool.send_message(&msg);
-            if sent_result.is_err() {
-                message_queue.insert_head(msg);
+
+        let mut buffer = [0_u8; 256];
+        
+        while let Some(text) = message_queue.peek(&mut buffer) {
+            info!("sending: {}", text);
+            let sent_result = tele_pool.send_message(text);
+            warn!("failed to send message");
+            if sent_result.is_ok() {
+                message_queue.remove_first();
             }
             
             if iter_cnt == MAX_ITER {
@@ -160,7 +170,8 @@ fn get_tele_notif(tele_pool: &mut TelePool<TELE_FETCH_LIMIT>, buffer: &mut [u8])
     let collect = incoming_message.result
         .into_iter()
         .filter(|updt| updt.message.text.starts_with('/'))
-        .map(|v| BotQuery {q: v.message.text}).collect();
+        .map(|v| BotQuery {q: v.message.text})
+        .collect();
 
     Ok(collect)
 }
@@ -246,12 +257,15 @@ fn sync_ntp() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn ensure_wifi_connected(wifi: &mut BlockingWifi<EspWifi<'static>>, config: &WifiConfig) -> Result<IpInfo, EspError> {
-    if !wifi.is_connected()? {
-        connect_wifi(wifi, config)?;
+fn ensure_wifi_connected(wifi: &mut BlockingWifi<EspWifi<'static>>, config: &WifiConfig) -> Result<(), EspError> {
+    if wifi.is_connected()? {
+        return Ok(());
     }
-
-    wifi.wifi().sta_netif().get_ip_info()
+    
+    connect_wifi(wifi, config)?;
+    let ip_info = wifi.wifi().sta_netif().get_ip_info();
+    info!("Wifi DHCP info: {:?}", ip_info);
+    Ok(())
 }
 
 fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, config: &WifiConfig) -> Result<(), EspError> {
@@ -267,12 +281,9 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, config: &WifiConfig) 
     wifi.set_configuration(&wifi_configuration)?;
 
     wifi.start()?;
-    info!("Wifi started");
-
     wifi.connect()?;
-    info!("Wifi connected");
-
     wifi.wait_netif_up()?;
+    info!("Wifi connected");
     info!("Wifi netif up");
 
     Ok(())
