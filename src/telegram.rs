@@ -1,5 +1,6 @@
 use embedded_svc::http::client::Client;
 use esp_idf_svc::http::client::{self, EspHttpConnection};
+use log::info;
 use serde::{Deserialize, Serialize};
 
 use crate::TelegramConfig;
@@ -43,7 +44,7 @@ impl<'cfg, const FETCH_LIMIT: usize> TelePool<'cfg, FETCH_LIMIT> {
         let response = request.submit()?;
         let status = response.status();
 
-        println!("Response code: {}\n", status);
+        info!("Response code: {}\n", status);
 
         let updates: Updates = try_read(buf, response)?;
         if let Some(update) = updates.result.last() {
@@ -63,7 +64,7 @@ impl<'cfg, const FETCH_LIMIT: usize> TelePool<'cfg, FETCH_LIMIT> {
                 chat_id: self.send_cnt,
                 text
             };
-            
+
             let buf = serde_json::to_vec(&message)?;
             request.write(&buf)?;
             request.flush()?;
@@ -94,24 +95,24 @@ fn try_read<'de, T: Deserialize<'de>>(buf: &'de mut [u8], response: client::Resp
     .map_err(|e| e.0)?;
 
     let res_body = std::str::from_utf8(&buf[..bytes_read])?;
-    println!("{:?}", buf);
+    info!("res body: {}", res_body);
     let body: T = serde_json::from_str(res_body)?;
     Ok(body)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct Updates {
     // pub ok: bool,
     pub result: Vec<Update>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct Update {
     pub update_id: u32,
     pub message: Message,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct Message {
     // pub chat: Chat,
     pub text: String,
