@@ -1,18 +1,19 @@
 use core::str;
+use std::time::Duration;
 use anyhow::Error;
-use embedded_svc::http::client::Client;
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop, hal::{delay::FreeRtos, gpio::{OutputPin, PinDriver}, prelude::Peripherals}, http::client::{Configuration as HttpConfiguration, EspHttpConnection}, nvs::EspDefaultNvsPartition, sntp::{EspSntp, SyncStatus}, sys::EspError, wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi}
 };
 use log::{info, warn};
+use queue::MsgFMQueue;
 use relay::{DoubleRelay, DoubleRelayStatus, RelayQuery, SetState};
 use serde::Deserialize;
-use telegram::TelePool;
-use util::FMemQueue;
+use telegram::{SendMessage, TelePool};
 
 mod relay;
 mod telegram;
 pub mod util;
+pub mod queue;
 
 #[derive(Deserialize, Debug)]
 struct AppConfig {
@@ -70,79 +71,65 @@ fn main() -> anyhow::Result<()> {
 
     sync_ntp()?;
 
-
-    let http_connection = {
-        let http_config = HttpConfiguration  {
-            use_global_ca_store: true,
-            crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
-            ..Default::default()
-        };
-        EspHttpConnection::new(&http_config)?
-    };
-
-    let client = Client::wrap(http_connection);
-    let mut tele_pool: TelePool<TELE_FETCH_LIMIT> = TelePool::new(client, &cfg.telegram);
+    let mut tele_pool: TelePool<TELE_FETCH_LIMIT> = TelePool::new(&cfg.telegram);
 
     // INITIALIZE PIN
     let mut relay = DoubleRelay::new(peripherals.pins.gpio5, peripherals.pins.gpio6);
 
-    let mut message_queue = FMemQueue::new(nvs)?;
-    loop {
-        FreeRtos::delay_ms(10000);
+    let mut message_queue = MsgFMQueue::new(nvs)?;
+    'm: loop {
+        info!("--- main loop ---");
+        FreeRtos::delay_ms(10_000);
 
+        // TODO: send feedback for who sent the order
         let rsvc = relay_service(&mut relay);
         if let Err(err) = rsvc {
-            let send_result = tele_pool.send_message(&err.to_string());
-            if let Err(err) = send_result {
-                warn!("{}", err);
-                message_queue.enqueue(&err.to_string());
-            }
+            warn!("{}", err);
         }
 
         let connect = ensure_wifi_connected(&mut wifi, &cfg.wifi);
         if let Err(err) = connect {
             warn!("err: {:?}", err);
-            continue;
+            continue 'm;
         }
     
         let tele_notif = {
             let mut buffer = [0u8; 1024];
             get_tele_notif(&mut tele_pool, &mut buffer)
         };
- 
+        
         match tele_notif {
             Ok(notification) => notification
                 .into_iter()
                 .for_each(|each| {
-                    match run_query(&each, &mut relay) {
-                        Ok(s) => { message_queue.enqueue(&s.to_string()); },
-                        Err(err) => { message_queue.enqueue(&err.to_string()); }
-                    }
+                    let text = match run_query(&each, &mut relay) {
+                        Ok(s) => s.to_string(),
+                        Err(err) => err.to_string()
+                    };
+
+                    let msg = SendMessage { chat_id: each.chat_id, text };
+                    message_queue.enqueue(msg);
                 }),
             Err(err) => { warn!("failed to get updates: {}", err); }
         };
 
 
-        const MAX_ITER: usize = 8;
-        let mut iter_cnt = 1;
-
-        let mut buffer = [0_u8; 256];
-        
-        while let Some(text) = message_queue.peek(&mut buffer) {
-            info!("sending: {}", text);
-            let sent_result = tele_pool.send_message(text);
-            warn!("failed to send message");
-            if sent_result.is_ok() {
-                message_queue.remove_first();
-            }
-            
-            if iter_cnt == MAX_ITER {
-                break;
-            }
-
-            iter_cnt += 1;
+        const MAX_SEND_EFFORT: usize = 8;
+        let send_result = send_message_queue(&mut tele_pool, &mut message_queue, MAX_SEND_EFFORT);
+        if let Err(err) = send_result {
+            warn!("send message from queue error: {}", err)
         }
     }
+}
+
+fn create_http_connection() -> anyhow::Result<EspHttpConnection> {
+    let http_config = HttpConfiguration  {
+        use_global_ca_store: true,
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        timeout: Some(Duration::from_secs(15)),
+        ..Default::default()
+    };
+    EspHttpConnection::new(&http_config).map_err(Into::into)
 }
 
 fn relay_service<R1, R2>(relay: &mut DoubleRelay<'_, R1, R2>) -> anyhow::Result<()>
@@ -165,19 +152,55 @@ fn relay_service<R1, R2>(relay: &mut DoubleRelay<'_, R1, R2>) -> anyhow::Result<
     Ok(())
 }
 
+fn send_message_queue(
+    tele_pool: &mut TelePool<TELE_FETCH_LIMIT>,
+    message_queue: &mut MsgFMQueue,
+    max_try: usize
+) -> anyhow::Result<()> {
+    let http_connection = create_http_connection()?;
+    tele_pool.set_connection(http_connection);
+
+    let mut buffer = [0_u8; 256];
+        
+    for _ in 0..max_try {
+        let msg = match message_queue.peek(&mut buffer) {
+            None => break,
+            Some(text) => text
+        };
+
+        info!("send chat: {}, text: {}", msg.chat_id, msg.text);
+        let sent_result = tele_pool.send_message(msg);
+        match sent_result {
+            Ok(_) => { message_queue.remove_first(); }, 
+            Err(err) => return Err(err)
+        }
+        FreeRtos::delay_ms(1000);
+    }
+
+    Ok(())
+}
+
 fn get_tele_notif(tele_pool: &mut TelePool<TELE_FETCH_LIMIT>, buffer: &mut [u8]) -> anyhow::Result<Vec<BotQuery>> {
+    let http_connection = create_http_connection()?;
+    tele_pool.set_connection(http_connection);
+
     let incoming_message = tele_pool.pool_fetch(buffer)?;
     let collect = incoming_message.result
         .into_iter()
         .filter(|updt| updt.message.text.starts_with('/'))
-        .map(|v| BotQuery {q: v.message.text})
+        .map(|v| BotQuery {
+            chat_id: v.message.chat.id,
+            q: v.message.text
+        })
         .collect();
-
+    
+    tele_pool.reset_connection();
     Ok(collect)
 }
 
 #[derive(Default)]
 pub struct BotQuery {
+    pub chat_id: u32,
     pub q: String
 }
 
