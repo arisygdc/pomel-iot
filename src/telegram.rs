@@ -1,3 +1,6 @@
+use core::str;
+
+use anyhow::Error;
 use embedded_svc::http::client::Client;
 use esp_idf_svc::http::client::{self, EspHttpConnection};
 use log::info;
@@ -6,21 +9,31 @@ use serde::{Deserialize, Serialize};
 use crate::TelegramConfig;
 
 pub struct TelePool<'cfg, const FETCH_LIMIT: usize> {
-    client: Client<EspHttpConnection>,
+    client: Option<Client<EspHttpConnection>>,
     last_updtid: u32,
-    send_cnt: u32,
     config: &'cfg TelegramConfig
 }
 
 impl<'cfg, const FETCH_LIMIT: usize> TelePool<'cfg, FETCH_LIMIT> {
+    /// this is empty client connection
+    /// call [`TelePool::set_connection`]
+    /// 
+    /// recomend to [`TelePool::reset_connection`] after use
     #[inline]
-    pub fn new(client: Client<EspHttpConnection>, config: &'cfg TelegramConfig) -> Self {
+    pub fn new(config: &'cfg TelegramConfig) -> Self {
         Self {
-            client,
+            client: None,
             last_updtid: 0,
-            send_cnt: 0,
             config
         }
+    }
+
+    pub  fn reset_connection(&mut self) {
+        self.client = None;
+    }
+
+    pub fn set_connection(&mut self, conn: EspHttpConnection) {
+        self.client = Some(Client::wrap(conn));
     }
 
     pub fn pool_fetch(&mut self, buf: &mut [u8]) -> anyhow::Result<Updates> {
@@ -39,8 +52,8 @@ impl<'cfg, const FETCH_LIMIT: usize> TelePool<'cfg, FETCH_LIMIT> {
             )
         };
         
-        let request = self.client.get(&url)?;
-
+        let client = self.client.as_mut().unwrap();
+        let request = client.get(&url)?;
         let response = request.submit()?;
         let status = response.status();
 
@@ -54,37 +67,55 @@ impl<'cfg, const FETCH_LIMIT: usize> TelePool<'cfg, FETCH_LIMIT> {
         Ok(updates)
     }
 
-    pub fn send_message(&mut self, text: &str) -> anyhow::Result<()> {
+    pub fn send_message(&mut self, msg: SendMessage) -> anyhow::Result<()> {
         let headers = [("Content-Type", "application/json")];
         let url = format!("{}/bot{}/sendMessage", self.config.api_base, self.config.bot_token);
-        let request = {
-            let mut request = self.client.post(url.as_ref(), &headers)?;
 
-            let message = SendMessage {
-                chat_id: self.send_cnt,
-                text
-            };
+        let client = self.client.as_mut().unwrap();
+        let mut request = client.post(url.as_ref(), &headers)?;
 
-            let buf = serde_json::to_vec(&message)?;
-            request.write(&buf)?;
-            request.flush()?;
-
-            request
-        };
+        let buf = serde_json::to_vec(&msg)?;
+        request.write(&buf)?;
 
         let response = request.submit()?;
         let status = response.status();
 
-        println!("Response code: {}\n", status);
+        if !matches!(status, 200..299) {
+            return Err(Error::msg(
+                format!("code {}: {:?}", 
+                response.status(), 
+                response.status_message()
+            )));
+        }
         
         Ok(())
     }
 }
 
 #[derive(Serialize)]
-struct SendMessage<'a> {
-    chat_id: u32,
-    text: &'a str
+pub struct SendMessage {
+    pub chat_id: u32,
+    pub text: String
+}
+
+impl SendMessage {
+    pub fn into_bytes(self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        
+        let chat_id = self.chat_id.to_be_bytes();
+        bytes.extend_from_slice(&chat_id);
+        bytes.extend_from_slice(self.text.as_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(buf: &[u8]) -> Self {
+        assert!(buf.len() > 5);
+        let s = unsafe { str::from_utf8_unchecked(&buf[4..]) };
+        Self { 
+            chat_id: u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]), 
+            text: s.to_owned()
+        }
+    }
 }
 
 fn try_read<'de, T: Deserialize<'de>>(buf: &'de mut [u8], response: client::Response<&mut EspHttpConnection>) -> anyhow::Result<T> {
@@ -95,7 +126,6 @@ fn try_read<'de, T: Deserialize<'de>>(buf: &'de mut [u8], response: client::Resp
     .map_err(|e| e.0)?;
 
     let res_body = std::str::from_utf8(&buf[..bytes_read])?;
-    info!("res body: {}", res_body);
     let body: T = serde_json::from_str(res_body)?;
     Ok(body)
 }
@@ -114,6 +144,11 @@ pub struct Update {
 
 #[derive(Deserialize, Debug)]
 pub struct Message {
-    // pub chat: Chat,
+    pub chat: Chat,
     pub text: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct Chat {
+    pub id: u32
 }
