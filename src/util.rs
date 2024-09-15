@@ -1,92 +1,135 @@
+use core::str;
 use std::fmt::Display;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::ptr;
+
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
+use log::{info, warn};
 
 const WIB_OFFSET: u64 = 25200;
 
-pub struct Queue<T> {
-    head: *mut Node<T>
+// pub enum QueueError {
+//     InsertAtFull,
+//     GetFromEmpty,
+//     EspError(EspError)
+// }
+
+enum QTarget {
+    Head = 0, 
+    Tail = 1
 }
 
-impl<T> Queue<T> {
-    pub fn new(val: T) -> Self {
-        let node = Node::new(val);
-        let p = allocate_pbox(node);
-        Self { head: p }
-    }
-
-    pub fn enqueue(&mut self, val: T) { 
-        let node = Node::new(val);
-        let p = allocate_pbox(node);
-
-        let head = self.head;
-        if head.is_null() {
-            self.head = p;
-            return;
-        }
-
-        unsafe { 
-            let gap_node = Self::traverse(head);
-            (*gap_node).next = p;
+impl Display for QTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            QTarget::Head => "head",
+            QTarget::Tail => "tail"
         };
+        write!(f, "{}", s)
+    }
+}
+
+// Ring buffer
+pub struct FMemQueue {
+    storage: EspNvs<NvsDefault>,
+    /// head = addr[0]
+    /// tail = addr[1]
+    addr: [u8; 2],
+}
+
+impl FMemQueue {
+    const QUEUE_LIMIT: u8 = 20;
+    const START_INDEX: u8 = 0x41;
+
+    pub fn new(partition: EspDefaultNvsPartition) -> anyhow::Result<Self> {
+        let storage = EspNvs::new(partition, "queue", true)?;
+        let head = storage.get_u8(&QTarget::Head.to_string())?.unwrap_or(Self::START_INDEX);
+        let tail = storage.get_u8(&QTarget::Tail.to_string())?.unwrap_or(Self::START_INDEX);
+
+        Ok(Self { 
+            storage,
+            addr: [head, tail],
+        })
     }
 
-    pub fn insert_head(&mut self, val: T) {
-        let mut node = Node::new(val);
-        
-        if !self.head.is_null() {
-            node.next = self.head;
+    fn increment_address(&mut self, target: QTarget) {
+        let key = target.to_string();
+        let idx = target as usize;
+
+        self.addr[idx] = self.increment(self.addr[idx]);
+        self.storage.set_u8(&key, self.addr[idx]).unwrap();
+    }
+
+    pub fn enqueue(&mut self, value: &str) -> bool {
+        let is_full = self.is_full();
+        if is_full {
+            warn!("queue full: {}", is_full);
+            return !is_full;
         }
-        
-        let p = allocate_pbox(node);
-        self.head = p;
+        let tail = unsafe { str::from_utf8_unchecked(&self.addr[1..])};
+        info!("set queue [{}] {}", tail, value);
+        self.storage.set_str(tail, value).unwrap();
+
+        // increment tail
+        self.increment_address(QTarget::Tail);
+        false
     }
 
-    #[inline]
-    unsafe fn traverse(mut node: *mut Node<T>) -> *mut Node<T> {
-        while !(*node).next.is_null() {
-            node = (*node).next;
+    pub fn dequeue<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a str> {
+        let peek = self.peek(buf)?;
+        match self.remove_first() {
+            true => panic!(),
+            false => Some(peek)
         }
-
-        node
     }
 
-    pub fn dequeue(&mut self) -> Option<T> {
-        if self.head.is_null() {
+    pub fn peek<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a str> {
+        if self.is_empty() {
+            warn!("queue empty: {}", self.is_empty());
             return None;
         }
 
-        let n_head = unsafe { Box::from_raw(self.head) };
-        self.head = n_head.next;
+        let head = unsafe { str::from_utf8_unchecked(&self.addr[0..1])};
+        info!("get queue [{}]", head);
+        let get_val = self.storage.get_str(head, buf).unwrap();
 
-        Some(n_head.value)
+        match get_val {
+            None => panic!(),
+            Some(rslt) => Some(rslt)
+        }
     }
 
-}
+    pub fn remove_first(&mut self) -> bool {
+        if self.is_empty() {
+            return false;
+        }
 
-impl<T> Default for Queue<T> {
-    fn default() -> Self {
-        Self { head: ptr::null_mut() }
+        let head = unsafe { str::from_utf8_unchecked(&self.addr[0..1])};
+
+        // increment head
+        self.storage.remove(head).unwrap();
+        self.increment_address(QTarget::Head);
+        true
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.addr[0] == self.addr[1]
+    }
+
+    pub fn is_full(&self) -> bool {
+        let inc_tail = self.increment(self.addr[1]);
+        let head = self.addr[0];
+        inc_tail == head
+    }
+    
+    fn increment(&self, index: u8) -> u8 {
+        if index == Self::START_INDEX + Self::QUEUE_LIMIT - 1 {
+            Self::START_INDEX
+        } else {
+            index + 1
+        }
     }
 }
 
-impl<T> Drop for Queue<T> {
-    fn drop(&mut self) {
-        while self.dequeue().is_some() {}
-    }
-}
-
-struct Node<T> {
-    value: T,
-    next: *mut Node<T>
-}
-
-impl<T> Node<T> {
-    #[inline]
-    fn new(val: T) -> Self {
-        Self { value: val, next: ptr::null_mut() }
-    }
-}
 
 #[derive(Clone, PartialEq, PartialOrd)]
 pub struct Time(u64);
@@ -160,9 +203,4 @@ pub fn sys_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
-}
-
-#[inline]
-fn allocate_pbox<T>(val: T) -> *mut T {
-    Box::into_raw(Box::new(val))
 }
