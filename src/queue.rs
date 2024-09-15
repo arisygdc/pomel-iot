@@ -1,8 +1,6 @@
 use core::str;
 use std::fmt::Display;
-
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
-use log::{info, warn};
 
 use crate::telegram::SendMessage;
 
@@ -43,11 +41,16 @@ impl MsgFMQueue {
 
     pub fn peek(&mut self, buf: &mut [u8]) -> Option<SendMessage> {
         let peek = self.inner.peek(buf)?;
-        Some(SendMessage::from_bytes(peek))
+        let msg = SendMessage::from_bytes(peek);
+        Some(msg)
     }
 
     pub fn remove_first(&mut self) -> bool {
         self.inner.remove_first()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 }
 
@@ -85,12 +88,10 @@ impl FMemQueue {
     pub fn enqueue(&mut self, value: &[u8]) -> bool {
         let is_full = self.is_full();
         if is_full {
-            warn!("queue full: {}", is_full);
             return !is_full;
         }
         let tail = unsafe { str::from_utf8_unchecked(&self.addr[1..])};
 
-        info!("set queue [{}]", tail);
         self.storage.set_blob(tail, value).unwrap();
 
         // increment tail
@@ -108,12 +109,10 @@ impl FMemQueue {
 
     pub fn peek<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
         if self.is_empty() {
-            warn!("queue empty: {}", self.is_empty());
             return None;
         }
 
         let head = unsafe { str::from_utf8_unchecked(&self.addr[0..1])};
-        info!("get queue [{}]", head);
         let get_val = self.storage.get_blob(head, buf).unwrap();
 
         match get_val {
