@@ -8,60 +8,61 @@ use serde::{Deserialize, Serialize};
 
 use crate::TelegramConfig;
 
-pub struct TelePool<'cfg, const FETCH_LIMIT: usize> {
-    client: Option<Client<EspHttpConnection>>,
+pub struct TeleAPI<'cfg> {
+    fetch_limit: usize,
     last_updtid: u32,
     config: &'cfg TelegramConfig
 }
 
-impl<'cfg, const FETCH_LIMIT: usize> TelePool<'cfg, FETCH_LIMIT> {
-    /// this is empty client connection
-    /// call [`TelePool::set_connection`]
-    /// 
-    /// recomend to [`TelePool::reset_connection`] after use
+impl<'cfg, 'cl> TeleAPI<'cfg> {
     #[inline]
-    pub fn new(config: &'cfg TelegramConfig) -> Self {
+    pub fn new(config: &'cfg TelegramConfig, fetch_limit: usize) -> Self {
         Self {
-            client: None,
+            fetch_limit,
             last_updtid: 0,
             config
         }
     }
 
-    pub  fn reset_connection(&mut self) {
-        self.client = None;
+    pub fn create_client(&'cl mut self, conn: EspHttpConnection) -> TeleClient<'cl, 'cfg> {
+        TeleClient {
+            client: Client::wrap(conn),
+            tele: self
+        }
     }
+}
 
-    pub fn set_connection(&mut self, conn: EspHttpConnection) {
-        self.client = Some(Client::wrap(conn));
-    }
+pub struct TeleClient<'tp, 'cfg> {
+    tele: &'tp mut TeleAPI<'cfg, >,
+    client: Client<EspHttpConnection>
+}
 
+impl<'tp, 'cfg> TeleClient<'tp, 'cfg> {
     pub fn pool_fetch(&mut self, buf: &mut [u8]) -> anyhow::Result<Updates> {
         let url = {
-            let offset = match self.last_updtid == 0 {
+            let offset = match self.tele.last_updtid == 0 {
                 true => String::new(),
-                false => format!("&offset={}", self.last_updtid+1)
+                false => format!("&offset={}", self.tele.last_updtid+1)
             };
 
             format!(
                 "{}/bot{}/getUpdates?limit={}{}", 
-                self.config.api_base, 
-                self.config.bot_token,
-                FETCH_LIMIT,
+                self.tele.config.api_base, 
+                self.tele.config.bot_token,
+                self.tele.fetch_limit,
                 offset
             )
         };
-        
-        let client = self.client.as_mut().unwrap();
-        let request = client.get(&url)?;
+
+        let request = self.client.get(&url)?;
         let response = request.submit()?;
         let status = response.status();
 
-        info!("Response code: {}\n", status);
-
         let updates: Updates = try_read(buf, response)?;
+        info!("Response code: {}", status);
         if let Some(update) = updates.result.last() {
-            self.last_updtid = update.update_id;
+            info!("Response message: {:?}", update);
+            self.tele.last_updtid = update.update_id;
         }
         
         Ok(updates)
@@ -69,10 +70,9 @@ impl<'cfg, const FETCH_LIMIT: usize> TelePool<'cfg, FETCH_LIMIT> {
 
     pub fn send_message(&mut self, msg: SendMessage) -> anyhow::Result<()> {
         let headers = [("Content-Type", "application/json")];
-        let url = format!("{}/bot{}/sendMessage", self.config.api_base, self.config.bot_token);
+        let url = format!("{}/bot{}/sendMessage", self.tele.config.api_base, self.tele.config.bot_token);
 
-        let client = self.client.as_mut().unwrap();
-        let mut request = client.post(url.as_ref(), &headers)?;
+        let mut request = self.client.post(url.as_ref(), &headers)?;
 
         let buf = serde_json::to_vec(&msg)?;
         request.write(&buf)?;
@@ -92,7 +92,7 @@ impl<'cfg, const FETCH_LIMIT: usize> TelePool<'cfg, FETCH_LIMIT> {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct SendMessage {
     pub chat_id: u32,
     pub text: String
