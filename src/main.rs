@@ -71,7 +71,7 @@ fn main() -> anyhow::Result<()> {
     sync_ntp()?;
 
     const TELE_FETCH_LIMIT: usize = 1;
-    let mut tele_pool = TeleAPI::new(&cfg.telegram, TELE_FETCH_LIMIT);
+    let mut tele_api = TeleAPI::new(&cfg.telegram, TELE_FETCH_LIMIT);
 
     // INITIALIZE PIN
     let mut relay = DoubleRelay::new(peripherals.pins.gpio5, peripherals.pins.gpio6);
@@ -79,12 +79,17 @@ fn main() -> anyhow::Result<()> {
     let mut message_queue = MsgFMQueue::new(nvs)?;
     'm: loop {
         info!("--- main loop ---");
-        FreeRtos::delay_ms(10_000);
+        FreeRtos::delay_ms(30_000);
 
         // TODO: send feedback for who sent the order
-        let rsvc = relay_service(&mut relay);
+        let rsvc = relay_service(&mut relay, &mut message_queue);
         if let Err(err) = rsvc {
-            warn!("{}", err);
+            warn!("{:?}", err);
+            let http_connection = create_http_connection()?;
+            let mut tele_pool = tele_api.create_client(http_connection);
+            let msg = SendMessage { chat_id: err.order_by, text: err.message };
+            tele_pool.send_message(msg).unwrap();
+            critical_section(&mut relay, &mut message_queue);
         }
 
         let connect = ensure_wifi_connected(&mut wifi, &cfg.wifi);
@@ -95,7 +100,7 @@ fn main() -> anyhow::Result<()> {
     
         let tele_notif = {
             let mut buffer = [0u8; 1024];
-            get_tele_notif(&mut tele_pool, &mut buffer)
+            get_tele_notif(&mut tele_api, &mut buffer)
         };
         
         match tele_notif {
@@ -121,7 +126,7 @@ fn main() -> anyhow::Result<()> {
         FreeRtos::delay_ms(10_000);
 
         const MAX_SEND_EFFORT: usize = 8;
-        let send_result = send_message_queue(&mut tele_pool, &mut message_queue, MAX_SEND_EFFORT);
+        let send_result = send_message_queue(&mut tele_api, &mut message_queue, MAX_SEND_EFFORT);
         if let Err(err) = send_result {
             warn!("send message from queue error: {}", err)
         }
@@ -138,12 +143,16 @@ fn create_http_connection() -> anyhow::Result<EspHttpConnection> {
     EspHttpConnection::new(&http_config).map_err(Into::into)
 }
 
-fn relay_service<R1, R2>(relay: &mut DoubleRelay<'_, R1, R2>) -> anyhow::Result<()>
+fn relay_service<R1, R2>(
+    relay: &mut DoubleRelay<'_, R1, R2>,
+    message_queue: &mut MsgFMQueue
+) -> Result<(), RelayServiError>
     where 
         R1: OutputPin,
         R2: OutputPin
 {
     let events = relay.pool_event();
+    
     for event in events.into_iter().flatten() {
         let addr = relay.resolve_addr(event.name).unwrap();
         if !event.run_deadline {
@@ -151,11 +160,58 @@ fn relay_service<R1, R2>(relay: &mut DoubleRelay<'_, R1, R2>) -> anyhow::Result<
         }
 
         let set_result = relay.set(addr, SetState::Stop);
+        let status = relay.get_status(addr);
+
+        let r_status = match status {
+            DoubleRelayStatus::Single(s) => s,
+            DoubleRelayStatus::Both(_) => panic!()
+        };
+
+        let inf = r_status.run_info.unwrap();
+        
         if let Err(err) = set_result {
-            return Err(Error::msg(format!("cannot stop {} when deadline exceed, reason: {}", event.name, err)));
+            let err = RelayServiError{
+                message: format!("cannot stop {} when deadline exceed, reason: {}", event.name, err),
+                order_by: inf.order_by
+            };
+            return Err(err);
         }
+
+        let msg = SendMessage {
+            chat_id: inf.order_by,
+            text: format!("Deadline... Turned off {}\nStart: {}\nFinish: {}", r_status.name, inf.start_at, inf.end_at)
+        };
+
+        message_queue.enqueue(msg);
     }
     Ok(())
+}
+
+fn critical_section<R1, R2>(
+    relay: &mut DoubleRelay<'_, R1, R2>,
+    message_queue: &mut MsgFMQueue
+) 
+    where 
+        R1: OutputPin,
+        R2: OutputPin
+{
+    let critical_retry = 12;
+    for _ in 0..critical_retry {
+        let retry = relay_service(relay, message_queue);
+        if retry.is_ok() {
+            return;
+        }
+        // delay 5 minutes
+        FreeRtos::delay_ms(300_000);
+    }
+
+    panic!()
+}
+
+#[derive(Debug)]
+struct RelayServiError {
+    order_by: u32,
+    message: String
 }
 
 fn send_message_queue(
@@ -197,10 +253,10 @@ fn get_tele_notif(tele_api: &mut TeleAPI, buffer: &mut [u8]) -> anyhow::Result<V
     let incoming_message = tele_client.pool_fetch(buffer)?;
     let collect = incoming_message.result
         .into_iter()
-        .map(|v| BotQuery {
+        .map(|mut v| BotQuery {
             chat_id: v.message.chat.id,
             is_command: v.message.text.starts_with('/'),
-            q: v.message.text,
+            q: v.message.text.split_off(1),
         })
         .collect();
     
@@ -215,7 +271,6 @@ pub struct BotQuery {
     pub is_command: bool
 }
 
-
 const INVALID_CMD: &str = "Invalid Command";
 const INVALID_UNIT: &str = "Invalid unit, example: 1h (one hours)";
 
@@ -229,9 +284,10 @@ fn run_command<'a, R1, R2> (
 {
     let mut split = q.q.split(' ');
     let top_cmd = split.next().ok_or(Error::msg(INVALID_CMD))?;
+    
     match top_cmd {
         "relay" => {
-            let mut rlq = RelayQuery::default();
+            let mut rlq = RelayQuery::new(q.chat_id);
             let r_name = split
                 .next()
                 .ok_or(Error::msg(INVALID_CMD))?;

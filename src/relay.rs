@@ -8,20 +8,25 @@ use crate::util::{sys_now, Time};
 #[derive(Clone)]
 pub struct RunOrder {
     pub start_at: Time,
-    pub end_at: Time
+    pub end_at: Time,
+    pub order_by: u32
 }
 
 impl RunOrder {
     #[inline]
     /// panic when end <= start
-    pub fn new(start_at: u64, end_at: u64) -> Self {
+    pub fn new(start_at: u64, end_at: u64, chat_id: u32) -> Self {
         assert!(start_at <= end_at);
-        Self{ start_at: Time::new(start_at), end_at: Time::new(end_at) }
+        Self{ 
+            start_at: Time::new(start_at), 
+            end_at: Time::new(end_at),
+            order_by: chat_id
+        }
     }
 }
 
 struct Relay<'drv, R> 
-where 
+where
     R: OutputPin
 {
     pin: PinDriver<'drv, R, Output>,
@@ -119,6 +124,20 @@ where
 
     pub fn set(&mut self, target: RelayAddr, state: SetState) -> anyhow::Result<()> {
         let muxed = target as u8;
+        if muxed == 3 && matches!(state, SetState::Run(_)) {
+            let first = self.first_relay.get_status();
+            let second = self.second_relay.get_status();
+
+            let mut err = String::new();
+            if first.run_info.is_some() {
+                err = format!("Relay {} at ON state, turn off first!", first.name);
+                if second.run_info.is_some() {
+                    err = format!("{}\nRelay {} at ON state, turn off first!", err, second.name);
+                }
+            }
+            return Err(anyhow::Error::msg(err));
+        }
+
         if (muxed & 1) == 1 {
             self.first_relay.set(state.clone())?;
         }
@@ -148,7 +167,7 @@ where
         let t = sys_now();
         let e1 = self.first_relay.is_run_deadline(t);
         let e2 = self.second_relay.is_run_deadline(t);
-
+        
         let mut events: [Option<Event>; 2] = [const { None }; 2];
         if e1 {
             events[0] = Some(Event{
@@ -194,7 +213,7 @@ where
                     None => t + 3600,
                     Some(dur) => t + dur as u64
                 };
-                SetState::Run(RunOrder::new(t, end))
+                SetState::Run(RunOrder::new(t, end, query.chat_id))
             }, false => SetState::Stop,
         };
         
@@ -226,16 +245,29 @@ impl<'r> Display for RelayStatus<'r> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Relay {} status ", self.name)?;
         match self.run_info {
-            None => write!(f, "off"),
-            Some(ord) => write!(f, "on\nstart: {}\nfinish: {}", ord.start_at, ord.end_at),
+            None => write!(f, "off."),
+            Some(ord) => write!(f, "on.\nStart: {}\nFinish: {}", ord.start_at, ord.end_at),
         }
     }
 }
 #[derive(Default)]
 pub struct RelayQuery<'a> {
+    /// reference for who sent the query
+    pub chat_id: u32,
+    /// relay name
     pub name: Option<&'a str>,
     /// set On when is true
     pub instruction: Option<bool>,
     /// time second
     pub duration: Option<u32>
+}
+
+impl<'a> RelayQuery<'a> {
+    #[must_use]
+    pub fn new(chat_id: u32) -> Self {
+        Self{
+            chat_id,
+            ..Default::default()
+        }
+    }
 }
