@@ -10,7 +10,7 @@ use crate::WifiConfig;
 
 const WIB_OFFSET: u64 = 25200;
 
-#[derive(Clone, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
 pub struct Time(u64);
 impl Time {
     pub fn new(t: u64) -> Self {

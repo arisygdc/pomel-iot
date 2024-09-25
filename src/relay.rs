@@ -2,10 +2,10 @@ use std::fmt::Display;
 
 use anyhow::Error;
 use esp_idf_svc::hal::{gpio::{Output, OutputPin, PinDriver}, peripheral::Peripheral};
-
+use log::info;
 use crate::util::{sys_now, Time};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RunOrder {
     pub start_at: Time,
     pub end_at: Time,
@@ -34,12 +34,13 @@ where
     running: Option<RunOrder>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum SetState {
     Run(RunOrder),
     Stop
 }
 
+#[derive(Debug)]
 pub struct Event {
     /// time to stop the device when its true
     pub run_deadline: bool,
@@ -65,7 +66,9 @@ where
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        self.pin.set_low().map_err(Into::into)
+        self.pin.set_low()?;
+        self.running = None;
+        Ok(())
     }
 
     fn set(&mut self, state: SetState) -> anyhow::Result<()> {
@@ -139,10 +142,12 @@ where
         }
 
         if (muxed & 1) == 1 {
+            info!("first relay set : {:?}", state);
             self.first_relay.set(state.clone())?;
         }
 
         if (muxed >> 1) == 1 {
+            info!("second relay set : {:?}", state);
             self.second_relay.set(state)?;
         }
 

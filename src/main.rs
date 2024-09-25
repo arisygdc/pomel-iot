@@ -122,8 +122,8 @@ fn main() -> anyhow::Result<()> {
             }),
             Err(err) => { warn!("failed to get updates: {}", err); }
         };
-        info!("--- Delay 2 ---");
-        FreeRtos::delay_ms(10_000);
+        
+        FreeRtos::delay_ms(20_000);
 
         const MAX_SEND_EFFORT: usize = 8;
         let send_result = send_message_queue(&mut tele_api, &mut message_queue, MAX_SEND_EFFORT);
@@ -152,37 +152,38 @@ fn relay_service<R1, R2>(
         R2: OutputPin
 {
     let events = relay.pool_event();
-    
+    info!("events: {:?}", events);
     for event in events.into_iter().flatten() {
         let addr = relay.resolve_addr(event.name).unwrap();
         if !event.run_deadline {
             continue;
         }
 
-        let set_result = relay.set(addr, SetState::Stop);
-        let status = relay.get_status(addr);
-
-        let r_status = match status {
-            DoubleRelayStatus::Single(s) => s,
-            DoubleRelayStatus::Both(_) => panic!()
+        let msg = {
+            let status = relay.get_status(addr);
+            let r_status = match status {
+                DoubleRelayStatus::Single(ref s) => s,
+                DoubleRelayStatus::Both(_) => panic!()
+            };
+            
+            let inf = r_status.run_info.unwrap();
+            (inf.order_by, SendMessage {
+                chat_id: inf.order_by,
+                text: format!("Deadline... Turned off {}\nStart: {}\nFinish: {}", r_status.name, inf.start_at, inf.end_at)
+            })
         };
 
-        let inf = r_status.run_info.unwrap();
-        
+        let set_result = relay.set(addr, SetState::Stop);
+
         if let Err(err) = set_result {
             let err = RelayServiError{
                 message: format!("cannot stop {} when deadline exceed, reason: {}", event.name, err),
-                order_by: inf.order_by
+                order_by: msg.0
             };
             return Err(err);
         }
 
-        let msg = SendMessage {
-            chat_id: inf.order_by,
-            text: format!("Deadline... Turned off {}\nStart: {}\nFinish: {}", r_status.name, inf.start_at, inf.end_at)
-        };
-
-        message_queue.enqueue(msg);
+        message_queue.enqueue(msg.1);
     }
     Ok(())
 }
