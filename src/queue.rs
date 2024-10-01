@@ -1,6 +1,6 @@
 use core::str;
-use std::fmt::Display;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
+use std::fmt::Display;
 
 use crate::telegram::SendMessage;
 
@@ -11,29 +11,31 @@ use crate::telegram::SendMessage;
 // }
 
 enum QTarget {
-    Head = 0, 
-    Tail = 1
+    Head = 0,
+    Tail = 1,
 }
 
 impl Display for QTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             QTarget::Head => "head",
-            QTarget::Tail => "tail"
+            QTarget::Tail => "tail",
         };
         write!(f, "{}", s)
     }
 }
 
 pub struct MsgFMQueue {
-    inner: FMemQueue
+    inner: FMemQueue,
 }
 
 impl MsgFMQueue {
     pub fn new(partition: EspDefaultNvsPartition) -> anyhow::Result<Self> {
-        Ok(Self{ inner: FMemQueue::new(partition)? })
+        Ok(Self {
+            inner: FMemQueue::new(partition)?,
+        })
     }
-    
+
     pub fn enqueue(&mut self, msg: SendMessage) -> bool {
         let buf = msg.into_bytes();
         self.inner.enqueue(&buf)
@@ -68,10 +70,14 @@ impl FMemQueue {
 
     pub fn new(partition: EspDefaultNvsPartition) -> anyhow::Result<Self> {
         let storage = EspNvs::new(partition, "queue", true)?;
-        let head = storage.get_u8(&QTarget::Head.to_string())?.unwrap_or(Self::START_INDEX);
-        let tail = storage.get_u8(&QTarget::Tail.to_string())?.unwrap_or(Self::START_INDEX);
+        let head = storage
+            .get_u8(&QTarget::Head.to_string())?
+            .unwrap_or(Self::START_INDEX);
+        let tail = storage
+            .get_u8(&QTarget::Tail.to_string())?
+            .unwrap_or(Self::START_INDEX);
 
-        Ok(Self { 
+        Ok(Self {
             storage,
             addr: [head, tail],
         })
@@ -90,7 +96,7 @@ impl FMemQueue {
         if is_full {
             return !is_full;
         }
-        let tail = unsafe { str::from_utf8_unchecked(&self.addr[1..])};
+        let tail = unsafe { str::from_utf8_unchecked(&self.addr[1..]) };
 
         self.storage.set_blob(tail, value).unwrap();
 
@@ -103,7 +109,7 @@ impl FMemQueue {
         let peek = self.peek(buf)?;
         match self.remove_first() {
             true => panic!(),
-            false => Some(peek)
+            false => Some(peek),
         }
     }
 
@@ -112,12 +118,12 @@ impl FMemQueue {
             return None;
         }
 
-        let head = unsafe { str::from_utf8_unchecked(&self.addr[0..1])};
+        let head = unsafe { str::from_utf8_unchecked(&self.addr[0..1]) };
         let get_val = self.storage.get_blob(head, buf).unwrap();
 
         match get_val {
             None => panic!(),
-            Some(rslt) => Some(rslt)
+            Some(rslt) => Some(rslt),
         }
     }
 
@@ -126,7 +132,7 @@ impl FMemQueue {
             return false;
         }
 
-        let head = unsafe { str::from_utf8_unchecked(&self.addr[0..1])};
+        let head = unsafe { str::from_utf8_unchecked(&self.addr[0..1]) };
 
         // increment head
         self.storage.remove(head).unwrap();
@@ -143,7 +149,7 @@ impl FMemQueue {
         let head = self.addr[0];
         inc_tail == head
     }
-    
+
     fn increment(&self, index: u8) -> u8 {
         if index == Self::START_INDEX + Self::QUEUE_LIMIT - 1 {
             Self::START_INDEX

@@ -1,15 +1,18 @@
 use std::fmt::Display;
 
-use anyhow::Error;
-use esp_idf_svc::hal::{gpio::{Output, OutputPin, PinDriver}, peripheral::Peripheral};
-use log::info;
 use crate::util::{sys_now, Time};
+use anyhow::Error;
+use esp_idf_svc::hal::{
+    gpio::{Output, OutputPin, PinDriver},
+    peripheral::Peripheral,
+};
+use log::info;
 
 #[derive(Clone, Debug)]
 pub struct RunOrder {
     pub start_at: Time,
     pub end_at: Time,
-    pub order_by: u32
+    pub order_by: u32,
 }
 
 impl RunOrder {
@@ -17,17 +20,17 @@ impl RunOrder {
     /// panic when end <= start
     pub fn new(start_at: u64, end_at: u64, chat_id: u32) -> Self {
         assert!(start_at <= end_at);
-        Self{ 
-            start_at: Time::new(start_at), 
+        Self {
+            start_at: Time::new(start_at),
             end_at: Time::new(end_at),
-            order_by: chat_id
+            order_by: chat_id,
         }
     }
 }
 
-struct Relay<'drv, R> 
+struct Relay<'drv, R>
 where
-    R: OutputPin
+    R: OutputPin,
 {
     pin: PinDriver<'drv, R, Output>,
     name: &'static str,
@@ -37,29 +40,40 @@ where
 #[derive(Clone, Debug)]
 pub enum SetState {
     Run(RunOrder),
-    Stop
+    Stop,
 }
 
 #[derive(Debug)]
 pub struct Event {
     /// time to stop the device when its true
     pub run_deadline: bool,
-    pub name: &'static str
+    pub name: &'static str,
 }
 
-impl<'drv, R> Relay<'drv, R> 
-where 
-    R: OutputPin
+impl<'drv, R> Relay<'drv, R>
+where
+    R: OutputPin,
 {
     #[inline]
     fn new(pin: PinDriver<'drv, R, Output>, name: &'static str) -> Self {
-        Self { pin, name, running: None }
+        Self {
+            pin,
+            name,
+            running: None,
+        }
     }
 
     fn run(&mut self, ord: RunOrder) -> anyhow::Result<()> {
         match self.running {
-            None => { self.running = Some(ord); }, 
-            Some(_) => return Err(Error::msg(format!("relay {} at ON state, turn off first!", self.name)))
+            None => {
+                self.running = Some(ord);
+            }
+            Some(_) => {
+                return Err(Error::msg(format!(
+                    "relay {} at ON state, turn off first!",
+                    self.name
+                )))
+            }
         }
 
         self.pin.set_high().map_err(Into::into)
@@ -74,7 +88,7 @@ where
     fn set(&mut self, state: SetState) -> anyhow::Result<()> {
         match state {
             SetState::Run(ord) => self.run(ord),
-            SetState::Stop => self.stop()
+            SetState::Stop => self.stop(),
         }
     }
 
@@ -86,17 +100,17 @@ where
     }
 
     fn get_status(&self) -> RelayStatus {
-        RelayStatus{
+        RelayStatus {
             name: self.name,
-            run_info: self.running.as_ref()
+            run_info: self.running.as_ref(),
         }
     }
 }
 
-pub struct DoubleRelay<'drv, R1, R2> 
-where 
+pub struct DoubleRelay<'drv, R1, R2>
+where
     R1: OutputPin,
-    R2: OutputPin
+    R2: OutputPin,
 {
     first_relay: Relay<'drv, R1>,
     second_relay: Relay<'drv, R2>,
@@ -106,22 +120,22 @@ where
 pub enum RelayAddr {
     First = 1,
     Second = 2,
-    Both = 3
+    Both = 3,
 }
 
 impl<'drv, R1, R2> DoubleRelay<'drv, R1, R2>
-where 
+where
     R1: OutputPin,
-    R2: OutputPin
+    R2: OutputPin,
 {
     #[inline]
     pub fn new(
-        first_pin: impl Peripheral<P = R1> + 'drv, 
-        second_pin: impl Peripheral<P = R2> + 'drv
+        first_pin: impl Peripheral<P = R1> + 'drv,
+        second_pin: impl Peripheral<P = R2> + 'drv,
     ) -> Self {
         Self {
-            first_relay: Relay::new(PinDriver::output(first_pin).unwrap(), "pompa_air"), 
-            second_relay: Relay::new(PinDriver::output(second_pin).unwrap(), "lain_lain"), 
+            first_relay: Relay::new(PinDriver::output(first_pin).unwrap(), "pompa_air"),
+            second_relay: Relay::new(PinDriver::output(second_pin).unwrap(), "lain_lain"),
         }
     }
 
@@ -135,7 +149,10 @@ where
             if first.run_info.is_some() {
                 err = format!("Relay {} at ON state, turn off first!", first.name);
                 if second.run_info.is_some() {
-                    err = format!("{}\nRelay {} at ON state, turn off first!", err, second.name);
+                    err = format!(
+                        "{}\nRelay {} at ON state, turn off first!",
+                        err, second.name
+                    );
                 }
             }
             return Err(anyhow::Error::msg(err));
@@ -167,24 +184,23 @@ where
     }
 
     #[must_use]
-    pub fn pool_event(&mut self) -> [Option<Event>; 2]
-    {
+    pub fn pool_event(&mut self) -> [Option<Event>; 2] {
         let t = sys_now();
         let e1 = self.first_relay.is_run_deadline(t);
         let e2 = self.second_relay.is_run_deadline(t);
-        
+
         let mut events: [Option<Event>; 2] = [const { None }; 2];
         if e1 {
-            events[0] = Some(Event{
+            events[0] = Some(Event {
                 name: self.first_relay.name,
-                run_deadline: e1
+                run_deadline: e1,
             })
         }
 
         if e2 {
-            events[1] = Some(Event{
+            events[1] = Some(Event {
                 name: self.second_relay.name,
-                run_deadline: e2
+                run_deadline: e2,
             })
         }
 
@@ -195,10 +211,12 @@ where
         let single = match target {
             RelayAddr::First => self.first_relay.get_status(),
             RelayAddr::Second => self.second_relay.get_status(),
-            RelayAddr::Both => return DoubleRelayStatus::Both([
-                self.first_relay.get_status(),
-                self.second_relay.get_status()
-            ])
+            RelayAddr::Both => {
+                return DoubleRelayStatus::Both([
+                    self.first_relay.get_status(),
+                    self.second_relay.get_status(),
+                ])
+            }
         };
 
         DoubleRelayStatus::Single(single)
@@ -208,7 +226,9 @@ where
     const INV_INSTRUCTION: &'static str = "invalid instruction";
     pub fn interprete(&mut self, query: RelayQuery) -> anyhow::Result<DoubleRelayStatus> {
         let name = query.name.ok_or(Error::msg(Self::NAME_NOTFOUND))?;
-        let r_addr = self.resolve_addr(name).ok_or(Error::msg(Self::NAME_NOTFOUND))?;
+        let r_addr = self
+            .resolve_addr(name)
+            .ok_or(Error::msg(Self::NAME_NOTFOUND))?;
 
         let instruction = query.instruction.ok_or(Error::msg(Self::INV_INSTRUCTION))?;
         let instruction = match instruction {
@@ -216,12 +236,13 @@ where
                 let t = sys_now();
                 let end = match query.duration {
                     None => t + 3600,
-                    Some(dur) => t + dur as u64
+                    Some(dur) => t + dur as u64,
                 };
                 SetState::Run(RunOrder::new(t, end, query.chat_id))
-            }, false => SetState::Stop,
+            }
+            false => SetState::Stop,
         };
-        
+
         self.set(r_addr, instruction)?;
         Ok(self.get_status(r_addr))
     }
@@ -229,21 +250,21 @@ where
 
 pub enum DoubleRelayStatus<'r> {
     Single(RelayStatus<'r>),
-    Both([RelayStatus<'r>; 2])
+    Both([RelayStatus<'r>; 2]),
 }
 
 impl<'r> Display for DoubleRelayStatus<'r> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DoubleRelayStatus::Single(s) => write!(f, "{}", s),
-            DoubleRelayStatus::Both(b) => write!(f, "{}\n\n{}", b[0], b[1])
+            DoubleRelayStatus::Both(b) => write!(f, "{}\n\n{}", b[0], b[1]),
         }
     }
 }
 
 pub struct RelayStatus<'r> {
     pub name: &'r str,
-    pub run_info: Option<&'r RunOrder>
+    pub run_info: Option<&'r RunOrder>,
 }
 
 impl<'r> Display for RelayStatus<'r> {
@@ -264,13 +285,13 @@ pub struct RelayQuery<'a> {
     /// set On when is true
     pub instruction: Option<bool>,
     /// time second
-    pub duration: Option<u32>
+    pub duration: Option<u32>,
 }
 
 impl<'a> RelayQuery<'a> {
     #[must_use]
     pub fn new(chat_id: u32) -> Self {
-        Self{
+        Self {
             chat_id,
             ..Default::default()
         }
