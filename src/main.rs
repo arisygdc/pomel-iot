@@ -79,17 +79,24 @@ fn main() -> anyhow::Result<()> {
     let mut message_queue = MsgFMQueue::new(nvs)?;
     'm: loop {
         info!("--- main loop ---");
-        FreeRtos::delay_ms(30_000);
+        for _ in 0..5 {
+            FreeRtos::delay_ms(10_000);
 
-        // TODO: send feedback for who sent the order
-        let rsvc = relay_service(&mut relay, &mut message_queue);
-        if let Err(err) = rsvc {
-            warn!("{:?}", err);
-            let http_connection = create_http_connection()?;
-            let mut tele_pool = tele_api.create_client(http_connection);
-            let msg = SendMessage { chat_id: err.order_by, text: err.message };
-            tele_pool.send_message(msg).unwrap();
-            critical_section(&mut relay, &mut message_queue);
+            let rsvc = relay_service(&mut relay, &mut message_queue);
+            if let Err(err) = rsvc {
+                warn!("{:?}", err);
+                let http_connection = create_http_connection()?;
+                let mut tele_pool = tele_api.create_client(http_connection);
+                let msg = SendMessage { chat_id: err.order_by, text: err.message };
+                tele_pool.send_message(msg).unwrap();
+                critical_section(&mut relay, &mut message_queue);
+            }
+
+            const MAX_SEND_EFFORT: usize = 8;
+            let send_result = send_message_queue(&mut tele_api, &mut message_queue, MAX_SEND_EFFORT);
+            if let Err(err) = send_result {
+                warn!("send message from queue error: {}", err)
+            }
         }
 
         let connect = ensure_wifi_connected(&mut wifi, &cfg.wifi);
@@ -122,14 +129,6 @@ fn main() -> anyhow::Result<()> {
             }),
             Err(err) => { warn!("failed to get updates: {}", err); }
         };
-        
-        FreeRtos::delay_ms(20_000);
-
-        const MAX_SEND_EFFORT: usize = 8;
-        let send_result = send_message_queue(&mut tele_api, &mut message_queue, MAX_SEND_EFFORT);
-        if let Err(err) = send_result {
-            warn!("send message from queue error: {}", err)
-        }
     }
 }
 
