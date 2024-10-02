@@ -19,12 +19,11 @@ jobs:
       fail-fast: false
       matrix:
         action:
-          - command: build
-            args: --release
           - command: fmt
             args: --all -- --check --color always
           - command: clippy
             args: --all-targets --all-features --workspace -- -D warnings
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,16 +37,34 @@ jobs:
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
 
-      - name: Install build dependencies
+      - name: Generate or copy config
         run: |
-          sudo apt update
-          sudo apt install build-essential gcc
-          cargo install cargo-espflash espflash ldproxy
-
-      - name: Generate or copy cfg.toml
-        run: |
-          # Command to generate or copy cfg.toml
           cp cfg.toml.example cfg.toml
           
       - name: Run command
         run: cargo ${{ matrix.action.command }} ${{ matrix.action.args }}
+
+  build-test:
+    needs: rust-checks
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout sources
+      uses: actions/checkout@v3
+
+    - name: Install Rust for Xtensa
+      uses: esp-rs/xtensa-toolchain@v1.5
+      with:
+        default: true
+        ldproxy: true
+        
+    - name: Generate or copy config
+      run: |
+        cp cfg.toml.example cfg.toml
+    
+    - name: Run cargo check
+      run: cargo check
+
+    - name: Build
+      run: |
+        set -ex
+        cargo build --release
